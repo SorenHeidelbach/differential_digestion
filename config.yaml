@@ -1,0 +1,6 @@
+NP_reads:
+  "data/processed/NP"
+IL_reads:
+  "data/processed/IL"
+PB_reads:
+  "data/processed/PB"

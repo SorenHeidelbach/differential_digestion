@@ -1,0 +1,7 @@
+.cache
+.dgl
+.keras
+.snakemake
+data
+results
+mmlong2
