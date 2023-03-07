@@ -562,3 +562,11 @@ names(freq) <- GCs
 freq
 
 ```
+
+
+```{r chunkedCoverage}
+
+
+
+
+```
