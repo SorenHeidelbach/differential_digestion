@@ -4,3 +4,7 @@ IL_reads:
   "data/processed/IL"
 PB_reads:
   "data/processed/PB"
+assembly:
+  "/user_data/sh/differential_digestion/mmlong2/tmp/polishing/asm_pol_lenfilt.fasta"
+threads:
+  50
