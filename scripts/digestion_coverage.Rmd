@@ -1,0 +1,460 @@
+---
+title: Differential Digestion
+author: Soren Heidelbach
+output:
+  bookdown::html_document2:
+    code_folding: hide
+    toc: true
+    toc_depth: 2
+  
+---
+
+# Differential Digestion
+
+```{r setup, setup}
+setwd("/home/ubuntu/vol_store/differential_digestion")
+pacman::p_load(
+  "data.table",
+  "magrittr",
+  "stringr",
+  "ggplot2",
+  "ggside",
+  "patchwork",
+  "gt",
+  "gtExtras",
+  "knitr",
+  "kableExtra",
+  "seqinr"
+)
+knitr::opts_knit$set(
+  root.dir = "/home/ubuntu/vol_store/differential_digestion"
+)
+knitr::opts_chunk$set(
+  fig.align = "center",
+  fig.width = 8,
+  fig.height = 6,
+  message = FALSE,
+  warning = FALSE,
+  echo = TRUE,
+  fig.path = "analysis/figures",
+  out.width = "95%"
+)
+
+plot_theme <- theme_bw(
+  base_size = 12,
+  base_family = "Helvetica"
+)
+
+
+```
+  
+
+
+```{r loadData}
+chunk_size_saved  <- 1e3
+chunk_size <- 5e3
+chunk_file  <- "data/processed/mmlong2_assembly_chunk_depths.tsv"
+
+if (file.exists(chunk_file)) {
+  chunks  <- fread(chunk_file, sep = "\t")[
+      , chunk := ceiling(chunk * (chunk_size_saved / chunk_size))
+    ][
+      , .(depth = mean(depth)), by = c("contig", "chunk", "sample")
+    ]
+} else {
+  # Load depth data
+  samples <- list.files("data/processed/mappings", full.names = TRUE)
+  samples <- samples[grepl('MboI|400', samples)]
+  depth <- lapply(
+    samples,
+    function(sample) {
+      depth_file <- paste0(sample, "/depth.txt")
+      if (file.exists(depth_file)) {
+        dt <- fread(depth_file, header = FALSE, sep = "\t") %>%
+          setnames(c("contig", "pos", "depth"))
+        dt[, sample := basename(sample)]
+        dt
+      } else {
+        NULL
+      }
+    }
+  )
+  depth <- rbindlist(depth)
+  depth[
+    , chunk := (pos %/% chunk_size_saved) + 1
+  ]
+  chunks <- depth[
+  , .(
+    depth = mean(depth)
+  ), by = c("contig", "chunk", "sample")
+  ]
+  fwrite(chunks, "data/processed/mmlong2_assembly_chunk_depths.tsv", sep = "\t", quote = FALSE)
+}
+
+
+contig_to_bin <- fread("mmlong2/tmp/binning/contig_bin.tsv", header = FALSE) %>%
+  setnames(c("contig", "bin"))
+
+bins <- fread("mmlong2/results/mmlong2_bins.tsv")[
+  , quality := ifelse(Completeness >= 90 & Contamination <= 5, "HQ", "MQ")
+  ][
+    , Type := "mmlong2"
+  ][
+    , GC_Content := GC_Content * 100
+  ]
+
+
+chunks <- Reduce(
+  function(x, y) {
+    shared_columns  <- intersect(names(x), names(y))
+    message(paste0(
+      "Merging by ",
+      paste(shared_columns, collapse = ", ")
+    ))
+    merge(x, y, by = shared_columns, all = TRUE)
+  },
+  list(chunks, contig_to_bin, bins)
+)
+
+chunks[
+    grepl("MboI", sample), sample := "MboI_digest"
+  ][
+    grepl("400bps", sample), sample := "Nondigest"
+  ][
+    , bin_char := str_extract(bin, "\\d+$")
+  ][
+    , bin_num := as.numeric(bin_char)
+  ][
+    , bin_char := fifelse(is.na(bin_char), "Unbinned", bin_char)
+  ][
+    , depth_centered := depth - mean(depth), by = c("bin_char")
+  ][
+    , depth_standard := depth_centered / sd(depth_centered), by = c("bin_char")
+  ][
+    , depth_log10 := log10(depth)
+  ][
+    , depth_log10_centered := depth_log10 - mean(depth_log10), by = c("bin_char")
+  ][
+    , depth_scaled_mean := depth / mean(depth) - 1, by = c("bin_char", "sample")
+  ]
+
+chunks_wide  <- dcast(
+  chunks,
+  bin_num + bin_char + chunk + contig ~ sample,
+  value.var = c("depth", "depth_centered", "depth_standard", "depth_log10_centered")
+)
+
+get_stats <- function(chunks, col) {
+  chunks[
+    get("col") != -Inf, list(
+      mean = mean(get(col), na.rm = TRUE),
+      median = median(get(col), na.rm = TRUE),
+      sd = sd(get(col), na.rm = TRUE),
+      n = .N,
+      q_max = quantile(get(col), probs = 0.75, na.rm = TRUE),
+      q_min = quantile(get(col), probs = 0.25, na.rm = TRUE),
+      q_75 = quantile(get(col), probs = 0.75, na.rm = TRUE),
+      q_25 = quantile(get(col), probs = 0.25, na.rm = TRUE),
+      min = min(get(col), na.rm = TRUE),
+      max = max(get(col), na.rm = TRUE)
+    ), by = c("bin_char", "sample")
+  ][
+    , c("CI_max", "CI_min", "IQR") := .(
+      mean - qt(0.999, n) * sd / sqrt(n),
+      mean - qt(0.001, n) * sd / sqrt(n),
+      q_75 - q_25
+    )
+  ]
+}
+chunks_stats <- get_stats(chunks, "depth")
+chunks_stats_scaled_mean <- get_stats(chunks, "depth_scaled_mean")
+
+chunks_sampleVSbin <- data.table::dcast(chunks, bin_char ~ sample, value.var = "depth", fun = list)
+chunks_sampleVSbin[
+  , p_val := p.adjust(
+      wilcox.test(
+        log10(Nondigest[[1]] + 1e-300), 
+        log10(MboI_digest[[1]] + 1e-300)
+      )$p.value,
+      method = "bonferroni",
+      n = nrow(chunks_sampleVSbin)
+    )
+  , by = bin_char
+]
+```
+
+```{r plotParameter}
+binary_colors  <- c("#a85959", "#0038b1")
+x_axis_order <- chunks[
+  sample == "Nondigest", .(median_depth_all = median(depth)), by = bin_char
+  ][
+    order(median_depth_all, decreasing = TRUE),
+    bin_char
+  ]
+x_axis_order <- c("Unbinned", x_axis_order[x_axis_order != "Unbinned"])
+```
+
+## Motivation
+To identify if the depletion by digestion is consistant within previously identified bins, to such an degree that differential targeting of digestion is believeable.
+
+1. The first objevtive is show differential depletion of bins, meaning there is some signal
+
+2. The second objective is to show that the depletion is somewhat consistant within bins after digestion
+
+Non parametric statistic is used to reduce the impact of outliers e.g. contig that may or may not be binned corretcly.
+
+## General distrubution of chunks
+Bloxplot of coverage of chunks within each bin. Black bar added to show all chunks below coverage 1 (Figure \@ref(chunkBoxplot)).
+```{r chunkBoxplot}
+ggplot(chunks) +
+  aes(x = bin_char, y = depth, color = sample) +
+  geom_boxplot(outlier.alpha = 0, outlier.size = 0.1) +
+  scale_y_log10(limits = c(1e-2, NA)) +
+  scale_x_discrete(limits = x_axis_order) +
+  scale_color_manual(values = binary_colors) +
+  plot_theme +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    legend.position = "bottom"
+  ) +
+  labs(
+    title = "Distrubution of Chunk Coverage by Bin (Boxplot)",
+    subtitle = paste0("Chunk size: ", chunk_size),
+    x = "Bin (Sorted by median depth of nondigest)",
+    y = "Chunk Coverage (log10)"
+  )
+```
+
+## Cleaner distrubution of chunks
+The same plot is generated again Figure \@ref(chunkQuantilePlot), but only with Q25 to Q75 to more easily see the differences between the samples.
+Additionally, Wilcox rank sum test is used to check p-value of the difference between before and after digestion (bonferroni corrected).
+
+```{r chunkQuantilePlot}
+merge(chunks_stats, chunks_sampleVSbin, by = "bin_char") %>%
+  ggplot() +
+    aes(x = bin_char, y = median, color = sample) +
+    geom_hline(yintercept = 1, linetype = 1, color = "black") +
+    geom_errorbar(aes(ymin = q_min, ymax = q_max), width = 0.3) +
+    geom_point(aes(fill = p_val), shape = 21, size = 1.5, color = "#000000") +
+    scale_y_log10(limits = c(1e-2, NA)) +
+    scale_x_discrete(limits = x_axis_order) +
+    scale_color_manual(
+      values = binary_colors,
+      guide = guide_legend(
+        title = "Sample",
+        title.position = "top",
+        title.hjust = 0.5
+      )
+    ) +
+    scale_fill_continuous(
+      low = "#000000", high = "white",
+      na.value = "#000000",
+      trans = "log10", limits = c(1e-6, 1),
+      guide = guide_colorbar(
+        title = "p-value (Wilcox)",
+        label.theme = element_text(angle = 30, size = 8),
+        title.position = "top",
+        label.hjust = 1,
+        reverse = TRUE,
+        title.hjust = 0.5
+      )
+      ) +
+    plot_theme +
+    theme(
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      legend.position = "bottom"
+    ) +
+    labs(
+      title = "Chunk Coverage by Bin (Q25-Median-Q75)",
+      subtitle = paste0("Chunk size: ", chunk_size),
+      x = "Bin",
+      y = "Chunk Coverage (log10)",
+      fill = "p-value",
+      color = "Sample"
+    )
+```
+
+
+## Initial remarks
+Bins seem to be targeted differentially, some are greatly reduced in chunk cvoerages and other are barely depleted.
+In figure \@ref(chunkQuantilePlot) the IQR is also quite nice for many of chunk digest chunk coverages, meaning atleast 50% of the bin is stably depleted. 
+
+
+# Within bins spread
+## Difference in IQR
+The change in chunk coverage inter quarttile range before and after digestion is plotted.
+The direction of the arrow is the direction of the change from nondigest to digest, and the length of the arrow is the change in inter quarttile range.
+Generally, it seems the digest chunk have a smaller inter quarttile range. This is counterintutive, and is probabl due to increase in IQR as mean increase. 
+
+```{r}
+x_axis_IQR_plot <- chunks_stats[
+  sample == "Nondigest",
+  ][
+    order(IQR, decreasing = TRUE),
+    bin_char
+  ]
+dcast(chunks_stats, bin_char ~ sample, value.var = c("IQR", "mean")) %>%
+  ggplot() +
+    aes(x = bin_char) +
+    geom_segment(
+      aes(
+        y = IQR_Nondigest,
+        yend = IQR_MboI_digest,
+        xend = bin_char,
+        color = fifelse(IQR_Nondigest > IQR_MboI_digest, "Nondigest", "MboI_digest")
+      ),
+      size = 1,
+      arrow = arrow(length = unit(0.1, "cm"))
+    ) +
+    scale_x_discrete(limits = x_axis_IQR_plot) +
+    plot_theme +
+    scale_y_continuous(expand = c(0.005, 0)) +
+    scale_color_manual(values = binary_colors) +
+    theme(
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      legend.position = "bottom"
+    ) +
+    labs(
+      title = "IQR of Chunk Coverages by Bin",
+      subtitle = paste0("Chunk size: ", chunk_size),
+      x = "Bin (Sorted by nondigested)",
+      y = "Inter Quartile Range (IQR)",
+      color = "Highest IQR"
+    )
+```
+
+## IQR correlation to Mean
+As expected IQR increases as mean increases (Figure\@ref(SDvsMeanBinCoverage)) .
+The change of each bin is also indicated by the connecting line. 
+The change of depleted bins is generally towards lower mean and a little lower IQR. 
+
+
+```{r SDvsMeanBinCoverage}
+chunks_stats %>%
+ggplot() +
+  aes(y = IQR, x = mean, color = sample) +
+  geom_segment(
+    data = dcast(chunks_stats, bin_char ~ sample, value.var = c("IQR", "mean")),
+    mapping = aes(
+      x = mean_Nondigest,
+      y = IQR_Nondigest,
+      xend = mean_MboI_digest,
+      yend = IQR_MboI_digest
+    ),
+    inherit.aes = FALSE,
+    alpha = 0.2
+  ) +
+  geom_point() +
+  scale_y_log10() +
+  scale_x_log10() +
+  scale_color_manual(values = binary_colors) +
+  geom_smooth(method = "lm", se = FALSE, size = 2, ) +
+  labs(
+    title = "Bin Coverage inter quarttile range vs Mean",
+    subtitle = paste0("Chunk size: ", chunk_size),
+    x = "Mean Bin Coverage (log10)",
+    y = "inter quarttile range of Bin Coverage (log10)",
+    color = "Sample"
+  ) +
+  plot_theme +
+  theme(
+    legend.position = "bottom"
+  )
+```
+
+## Change in IQR and Mean
+The change in IQR and mean (essentially the connecting line Figure \@ref(SDvsMeanBinCoverage)) is 
+plotted in Figure \@ref(SDvsMeanBinCoverageChange).
+The change in correlates very nicely with the change in mean.
+
+```{r}
+dcast(chunks_stats, bin_char ~ sample, value.var = c("IQR", "mean"))[
+    , IQR_diff := IQR_Nondigest - IQR_MboI_digest
+  ][
+    , mean_diff := mean_Nondigest - mean_MboI_digest
+  ] %>%
+  ggplot() +
+    aes(x = mean_diff, y = IQR_diff) +
+    geom_point() +
+    scale_y_log10() +
+    scale_x_log10() +
+    labs(
+      title = "Bin Coverage inter quarttile range diff vs Mean diff",
+      subtitle = paste0("Chunk size: ", chunk_size),
+      x = "IQR diff\nNondigest - MboI Digest",
+      y = "Mean diff\nNondigest - MboI Digest",
+      color = "Sample"
+    ) +
+    plot_theme
+
+```
+
+To investigate the difference in spread between the samples, the coverage is scaled by the mean coverage of the bin.
+This is done eliminate the increase in values that arise at higher coverage values. 
+The scaling happens within each bin and sample, so the mean of the scaled values is 1 within groups.
+
+
+
+```{r chunkBoxplotScaledMean}
+ggplot(chunks) +
+  aes(x = bin_char, y = depth_scaled_mean, color = sample) +
+  geom_boxplot(outlier.alpha = 0, outlier.size = 0.1) +
+  scale_x_discrete(limits = x_axis_order) +
+  scale_color_manual(values = binary_colors) +
+  ylim(-1, 4) +
+  plot_theme +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    legend.position = "bottom"
+  ) +
+  labs(
+    title = "Difference in chunk spread (coverage / mean(coverage))",
+    subtitle = paste0("Chunk size: ", chunk_size),
+    x = "Bin (Sorted by median depth of nondigest)",
+    y = "Scaled Chunk Coverage"
+  )
+```
+
+At a glance the spread of the digested samples appear larger. 
+The shift in inter quarttile range and IQR of scaled means is investigated to evaluate this \@ref()
+
+```{r SDplotScaledMean}
+x_axis_IQR_plot <- chunks_stats_scaled_mean[
+  sample == "Nondigest",
+  ][
+    order(IQR, decreasing = TRUE),
+    bin_char
+  ]
+dcast(chunks_stats_scaled_mean, bin_char ~ sample, value.var = "IQR") %>%
+  ggplot() +
+    aes(x = bin_char) +
+  scale_color_manual(values = binary_colors) +
+    geom_segment(
+      aes(
+        y = Nondigest,
+        yend = MboI_digest,
+        xend = bin_char,
+        color = fifelse(Nondigest > MboI_digest, "Nondigest", "MboI_digest")
+      ),
+      size = 1,
+      arrow = arrow(length = unit(0.1, "cm"))
+    ) +
+    scale_x_discrete(limits = x_axis_sd_plot) +
+    plot_theme +
+    theme(
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      legend.position = "bottom"
+    ) +
+    labs(
+      title = "IQR of Scaled Chunk Coverages by Bin",
+      subtitle = paste0("Chunk size: ", chunk_size),
+      x = "Bin (Sorted by nondigested IQR)",
+      y = "Inter Quartile Range (IQR)",
+      color = "Highest IQR"
+    )
+```

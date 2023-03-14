@@ -10,3 +10,4 @@ render_fun <- function(rmd) {
 }
 
 render_fun("scripts/initial_investigation.Rmd")
+render_fun("scripts/digestion_coverage.Rmd")
